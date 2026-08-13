@@ -67,6 +67,31 @@ a usage error, `2` is findings under `--strict`, so a typo'd flag can never read
 as a clean gate.
 
 Recognized reference forms: `process.env.KEY`, `process.env['KEY']`,
-`import.meta.env.KEY`, `Bun.env.KEY`, and the bracketed variants. Doc comments
-are stripped before matching. `node_modules`, `.git`, `dist`, `build`, and
-`.react-router` are skipped.
+`import.meta.env.KEY`, `Bun.env.KEY`, and the bracketed variants. `node_modules`,
+`.git`, `dist`, `build`, and `.react-router` are skipped.
+
+#### What it holds back, and where
+
+A few names are runtime-provided, so flagging them as Missing is pure noise:
+
+| Key | Suppressed from Missing when |
+| --- | --- |
+| `NODE_ENV` | always |
+| `MODE`, `DEV`, `PROD`, `SSR`, `BASE_URL` | read via `import.meta.env` (Vite's built-ins) |
+
+This suppression applies to the **Missing bucket only**. The same name sitting in
+an env *file* is still reported, because it means someone wrote a value the
+runtime is going to override. `BASE_URL` is gated on the reference form because
+it is both a Vite built-in and a name real apps use for their own server-side
+config; `process.env.BASE_URL` is your variable and gets reported normally.
+
+Anything held back is named in the output, so a clean report is never
+indistinguishable from a filtered one.
+
+#### Known limitation
+
+Whole-line `//` and block comments are stripped before matching, so env names in
+documentation are not counted as references. Trailing `//` comments are
+deliberately **not** stripped, because that would also eat `https://` inside
+string literals on the same line. A key mentioned only in a trailing comment will
+be reported as Missing. Use `--ignore` for it.

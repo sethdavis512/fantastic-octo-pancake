@@ -31,6 +31,8 @@ type Options = {
 
 type Scope = 'server' | 'client';
 
+type ReferenceForm = 'runtime' | 'import-meta';
+
 type Finding = {
     key: string;
     scope: Scope;
@@ -48,6 +50,8 @@ type Report = {
         undocumented: Finding[];
         stale: Finding[];
     };
+    /** Built-in keys held back from Missing, so "clean" is not confused with "filtered". */
+    suppressedFromMissing: string[];
 };
 
 const USAGE_ERROR = 1;
@@ -69,11 +73,23 @@ const SKIPPED_DIRECTORIES = new Set([
  * Matches process.env.KEY, process.env['KEY'], import.meta.env.KEY,
  * Bun.env.KEY, and the bracketed forms of each.
  */
-const ENV_REFERENCE_PATTERNS = [
-    /(?:process|Bun)\.env\.([A-Za-z_][A-Za-z0-9_]*)/g,
-    /(?:process|Bun)\.env\[\s*['"`]([A-Za-z_][A-Za-z0-9_]*)['"`]\s*\]/g,
-    /import\.meta\.env\.([A-Za-z_][A-Za-z0-9_]*)/g,
-    /import\.meta\.env\[\s*['"`]([A-Za-z_][A-Za-z0-9_]*)['"`]\s*\]/g
+const ENV_REFERENCE_PATTERNS: { pattern: RegExp; form: ReferenceForm }[] = [
+    {
+        pattern: /(?:process|Bun)\.env\.([A-Za-z_][A-Za-z0-9_]*)/g,
+        form: 'runtime'
+    },
+    {
+        pattern: /(?:process|Bun)\.env\[\s*['"`]([A-Za-z_][A-Za-z0-9_]*)['"`]\s*\]/g,
+        form: 'runtime'
+    },
+    {
+        pattern: /import\.meta\.env\.([A-Za-z_][A-Za-z0-9_]*)/g,
+        form: 'import-meta'
+    },
+    {
+        pattern: /import\.meta\.env\[\s*['"`]([A-Za-z_][A-Za-z0-9_]*)['"`]\s*\]/g,
+        form: 'import-meta'
+    }
 ];
 
 /**
@@ -88,8 +104,32 @@ function stripComments(source: string): string {
         .replace(/^[ \t]*\/\/.*$/gm, '');
 }
 
-/** Keys the runtime provides; flagging these as missing is noise. */
-const BUILT_IN_KEYS = new Set(['NODE_ENV', 'MODE', 'DEV', 'PROD', 'SSR', 'BASE_URL']);
+/**
+ * Keys the runtime provides, so nobody puts them in `.env` and flagging them as
+ * Missing is pure noise.
+ *
+ * This suppression applies to the Missing bucket ONLY. The same name appearing
+ * in an env *file* is a real finding: it means someone wrote a value the runtime
+ * is going to override, which is exactly the drift this script exists to catch.
+ *
+ * `NODE_ENV` is provided for any `process.env` / `Bun.env` read. The rest are
+ * Vite's `import.meta.env` built-ins, so they are only suppressed when that is
+ * the form actually used. `BASE_URL` in particular is both a Vite built-in and a
+ * name real apps use for their own server-side config, and suppressing it
+ * everywhere would let a genuine variable go undocumented behind a clean gate.
+ */
+const RUNTIME_BUILT_IN_KEYS = new Set(['NODE_ENV']);
+const IMPORT_META_BUILT_IN_KEYS = new Set([
+    'MODE',
+    'DEV',
+    'PROD',
+    'SSR',
+    'BASE_URL'
+]);
+
+function builtInKeyList(): string {
+    return [...RUNTIME_BUILT_IN_KEYS, ...IMPORT_META_BUILT_IN_KEYS].join(', ');
+}
 
 class UsageError extends Error {}
 
@@ -148,7 +188,11 @@ function parseArgs(argv: string[]): Options {
                         '  -h, --help          show this message',
                         '',
                         'Reports key names only, never values.',
-                        'Exit codes: 0 clean, 1 usage error, 2 findings under --strict.'
+                        'Exit codes: 0 clean, 1 usage error, 2 findings under --strict.',
+                        '',
+                        `Held back from Missing as runtime built-ins: ${builtInKeyList()}.`,
+                        'NODE_ENV always; the rest only when read via import.meta.env.',
+                        'They are still reported if they appear in an env file.'
                     ].join('\n')
                 );
                 process.exit(0);
@@ -174,11 +218,14 @@ function isSkipped(relativePath: string): boolean {
 /**
  * Collects env var names referenced in source. Values are never read.
  */
-async function collectReferencedKeys(
-    dir: string
-): Promise<{ keys: Set<string>; filesScanned: number }> {
+async function collectReferencedKeys(dir: string): Promise<{
+    keys: Set<string>;
+    importMetaKeys: Set<string>;
+    filesScanned: number;
+}> {
     const glob = new Bun.Glob(SOURCE_GLOB);
     const keys = new Set<string>();
+    const importMetaKeys = new Set<string>();
     let filesScanned = 0;
 
     for await (const relativePath of glob.scan({ cwd: dir, onlyFiles: true })) {
@@ -191,18 +238,21 @@ async function collectReferencedKeys(
         );
         filesScanned++;
 
-        for (const pattern of ENV_REFERENCE_PATTERNS) {
+        for (const { pattern, form } of ENV_REFERENCE_PATTERNS) {
             pattern.lastIndex = 0;
             for (const match of source.matchAll(pattern)) {
                 const key = match[1];
                 if (key) {
                     keys.add(key);
+                    if (form === 'import-meta') {
+                        importMetaKeys.add(key);
+                    }
                 }
             }
         }
     }
 
-    return { keys, filesScanned };
+    return { keys, importMetaKeys, filesScanned };
 }
 
 /**
@@ -236,9 +286,13 @@ async function collectEnvFileKeys(
     return { keys, present: true };
 }
 
-function toFindings(keys: Iterable<string>, ignore: Set<string>): Finding[] {
+function toFindings(
+    keys: Iterable<string>,
+    ignore: Set<string>,
+    suppress: (key: string) => boolean = () => false
+): Finding[] {
     return [...keys]
-        .filter((key) => !ignore.has(key) && !BUILT_IN_KEYS.has(key))
+        .filter((key) => !ignore.has(key) && !suppress(key))
         .map((key) => ({ key, scope: scopeOf(key) }))
         .sort(
             (a, b) =>
@@ -304,6 +358,16 @@ function renderMarkdown(report: Report): string {
         );
     }
 
+    if (report.suppressedFromMissing.length > 0) {
+        sections.push(
+            `> Held back from Missing as runtime built-ins: ${report.suppressedFromMissing
+                .map((key) => `\`${key}\``)
+                .join(
+                    ', '
+                )}. They are still reported if they appear in an env file.`
+        );
+    }
+
     return sections.join('\n\n');
 }
 
@@ -325,6 +389,13 @@ async function buildReport(options: Options): Promise<Report> {
         collectEnvFileKeys(envPath)
     ]);
 
+    const isBuiltIn = (key: string) =>
+        RUNTIME_BUILT_IN_KEYS.has(key) ||
+        (IMPORT_META_BUILT_IN_KEYS.has(key) &&
+            referenced.importMetaKeys.has(key));
+
+    const missingCandidates = difference(referenced.keys, envFile.keys);
+
     return {
         dir: options.dir,
         exampleFile: options.example,
@@ -333,10 +404,7 @@ async function buildReport(options: Options): Promise<Report> {
         exampleFilePresent: exampleFile.present,
         filesScanned: referenced.filesScanned,
         findings: {
-            missing: toFindings(
-                difference(referenced.keys, envFile.keys),
-                options.ignore
-            ),
+            missing: toFindings(missingCandidates, options.ignore, isBuiltIn),
             undocumented: toFindings(
                 difference(envFile.keys, exampleFile.keys),
                 options.ignore
@@ -345,7 +413,10 @@ async function buildReport(options: Options): Promise<Report> {
                 difference(exampleFile.keys, referenced.keys),
                 options.ignore
             )
-        }
+        },
+        suppressedFromMissing: missingCandidates
+            .filter((key) => !options.ignore.has(key) && isBuiltIn(key))
+            .sort()
     };
 }
 
