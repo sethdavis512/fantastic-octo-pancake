@@ -1,0 +1,13 @@
+{
+    "name": "fantastic-octo-pancake",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "repo-report": "bun tools/repo-report.ts",
+        "typecheck": "tsc --noEmit"
+    },
+    "devDependencies": {
+        "@types/bun": "latest",
+        "typescript": "^5.9.2"
+    }
+}
