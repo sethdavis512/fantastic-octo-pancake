@@ -3,6 +3,7 @@
     "private": true,
     "type": "module",
     "scripts": {
+        "env-doctor": "bun tools/env-doctor.ts",
         "repo-report": "bun tools/repo-report.ts",
         "typecheck": "tsc --noEmit"
     },
